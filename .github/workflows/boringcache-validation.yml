@@ -29,6 +29,9 @@ concurrency:
   group: llama-cpp-full-cpu-validation
   cancel-in-progress: false
 
+env:
+  GIT_OPTIONAL_LOCKS: '0'
+
 jobs:
   source:
     name: Prepare pinned source
@@ -152,7 +155,7 @@ jobs:
             git -C upstream apply --check ../operator/.github/boringcache-ccache.patch
             git -C upstream apply ../operator/.github/boringcache-ccache.patch
           fi
-          git -C upstream diff > "$RUNNER_TEMP/validation/source.patch"
+          git -c diff.autoRefreshIndex=false -C upstream diff > "$RUNNER_TEMP/validation/source.patch"
           sha256sum upstream/.devops/cpu.Dockerfile > "$RUNNER_TEMP/validation/effective-dockerfile.sha256"
           cp upstream/.devops/cpu.Dockerfile "$RUNNER_TEMP/validation/cpu.Dockerfile"
           cp operator/.boringcache.toml "$RUNNER_TEMP/validation/plan.toml"
@@ -161,6 +164,8 @@ jobs:
             printf 'APP_VERSION=%s\n' "$(git -C upstream describe --tags --always)"
             printf 'APP_REVISION=%s\n' "$SOURCE_SHA"
           } >> "$GITHUB_ENV"
+          find upstream/.git -type f -print0 | sort -z | xargs -0 sha256sum \
+            > "$RUNNER_TEMP/validation/git-metadata.sha256"
 
       - name: Record Docker versions
         run: |
