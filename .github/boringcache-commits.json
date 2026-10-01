@@ -1,0 +1,27 @@
+{
+  "upstream": "ggml-org/llama.cpp",
+  "branch": "master",
+  "captured_head": "d775ebf363f777bc862a8659b6c55eec9419cf35",
+  "commits": [
+    {
+      "sha": "4b1622afb7dccc819df968d1ef9bb5ebeeac5538",
+      "subject": "webgpu: add bfloat16 support for MUL_MAT/MUL_MAT_ID/GET_ROWS- #29358 (#29358)"
+    },
+    {
+      "sha": "13b4d7135a6351f81e1eccf6361a4eafd50350eb",
+      "subject": "metal : release temporary private transfer buffers (#29777)"
+    },
+    {
+      "sha": "42d958167a748f2c04b1f888e84e7a58f609ddcb",
+      "subject": "cuda : route sm70 to the Turing MMVQ nwarps table (#29753)"
+    },
+    {
+      "sha": "2b36825cbc39b06ed9512b487a67127206e474af",
+      "subject": "convert : write Gemma embedding scale for DFlash drafts (#29802)"
+    },
+    {
+      "sha": "d775ebf363f777bc862a8659b6c55eec9419cf35",
+      "subject": "server: return HTTP 400 for invalid embedding requests (#29060)"
+    }
+  ]
+}

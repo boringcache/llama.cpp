@@ -1,0 +1,296 @@
+name: BoringCache llama.cpp CPU validation
+run-name: llama.cpp CPU ${{ inputs.phase }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Cache phase
+        required: true
+        type: choice
+        options: [connect, cold, warm, rolling]
+      cli_version:
+        description: Optional exact BoringCache CLI release or prerelease
+        required: false
+        default: ''
+        type: string
+      source_run:
+        description: Cold run ID whose exact source archive the warm phase reuses
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: llama-cpp-full-cpu-validation
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Prepare pinned source
+    if: inputs.phase != 'connect' && inputs.phase != 'warm' && github.repository == 'boringcache/llama.cpp' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Checkout validation plan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: operator
+          persist-credentials: false
+      - name: Select upstream source
+        id: source
+        shell: bash
+        run: |
+          source_sha=$(cat operator/.github/boringcache-upstream)
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+      - name: Checkout source with build metadata
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ steps.source.outputs.sha }}
+          path: upstream
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Archive exact Docker context
+        run: tar -C upstream -cf "$RUNNER_TEMP/llama-source.tar" .
+      - name: Retain source for all builders and unchanged repeat
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: llama-source
+          path: ${{ runner.temp }}/llama-source.tar
+          retention-days: 30
+
+  connect:
+    if: inputs.phase == 'connect' && github.repository == 'boringcache/llama.cpp' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install BoringCache CLI for enrollment
+        run: |
+          curl -fsSL https://install.boringcache.com/install.sh -o "$RUNNER_TEMP/install-boringcache.sh"
+          sh "$RUNNER_TEMP/install-boringcache.sh"
+          printf '%s/.local/bin\n' "$HOME" >> "$GITHUB_PATH"
+      - name: Connect GitHub OIDC
+        run: boringcache ci connect --oidc-provider github-actions
+
+  build:
+    name: ${{ matrix.provider }} full CPU ${{ inputs.phase }}
+    needs: source
+    if: always() && (needs.source.result == 'success' || inputs.phase == 'warm') && inputs.phase != 'connect' && github.repository == 'boringcache/llama.cpp' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [Registry, Ccache, BoringCache]
+    env:
+      CACHE_REF: ghcr.io/boringcache/llama-cpp-validation-cache:${{ matrix.provider == 'Registry' && 'upstream' || 'ccache' }}-cpu-amd64-20261001
+    steps:
+      - name: Checkout validation plan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: operator
+          persist-credentials: false
+
+      - name: Select upstream source
+        id: source
+        shell: bash
+        env:
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          source_sha=$(cat operator/.github/boringcache-upstream)
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/validation"
+          printf 'BORINGCACHE_OBSERVABILITY_JSONL_PATH=%s/validation/boringcache-telemetry.jsonl\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf '%s\n' "$source_sha" > "$RUNNER_TEMP/validation/upstream-sha.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/validation/workflow-sha.txt"
+          printf '%s\n' "$PHASE" > "$RUNNER_TEMP/validation/phase.txt"
+          printf '%s\n' "$GITHUB_RUN_ID" > "$RUNNER_TEMP/validation/run-id.txt"
+          { uname -a; nproc; free -h; df -h; } > "$RUNNER_TEMP/validation/runner.txt"
+
+      - name: Require source archive for unchanged repeat
+        if: inputs.phase == 'warm'
+        shell: bash
+        env:
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: '[[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]'
+
+      - name: Download exact upstream source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: llama-source
+          path: source-archive
+          run-id: ${{ inputs.phase == 'warm' && inputs.source_run || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract source with Git metadata
+        run: |
+          mkdir upstream
+          tar -C upstream -xf source-archive/llama-source.tar
+          sha256sum source-archive/llama-source.tar > "$RUNNER_TEMP/validation/source-archive.sha256"
+
+      - name: Verify source and apply compiler-cache patch
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git -C upstream status --porcelain)"
+          sha256sum upstream/.devops/cpu.Dockerfile upstream/.dockerignore \
+            > "$RUNNER_TEMP/validation/upstream-inputs.sha256"
+          if [ "$PROVIDER" != Registry ]; then
+            git -C upstream apply --check ../operator/.github/boringcache-ccache.patch
+            git -C upstream apply ../operator/.github/boringcache-ccache.patch
+          fi
+          git -C upstream diff > "$RUNNER_TEMP/validation/source.patch"
+          sha256sum upstream/.devops/cpu.Dockerfile > "$RUNNER_TEMP/validation/effective-dockerfile.sha256"
+          cp upstream/.devops/cpu.Dockerfile "$RUNNER_TEMP/validation/cpu.Dockerfile"
+          cp operator/.boringcache.toml "$RUNNER_TEMP/validation/plan.toml"
+          {
+            printf 'BUILD_DATE=%s\n' "$(git -C upstream show -s --format=%cI HEAD)"
+            printf 'APP_VERSION=%s\n' "$(git -C upstream describe --tags --always)"
+            printf 'APP_REVISION=%s\n' "$SOURCE_SHA"
+          } >> "$GITHUB_ENV"
+
+      - name: Record Docker versions
+        run: |
+          docker version > "$RUNNER_TEMP/validation/docker-version.txt"
+          docker buildx version > "$RUNNER_TEMP/validation/buildx-version.txt"
+
+      - name: Set up registry builder
+        if: matrix.provider != 'BoringCache'
+        id: registry_builder
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to validation registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore conventional ccache for publication
+        if: matrix.provider == 'Ccache' && inputs.phase != 'warm'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ccache
+          key: llama-cpp-ccache-cpu-amd64-20261001-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ inputs.phase != 'cold' && 'llama-cpp-ccache-cpu-amd64-20261001-' || '' }}
+
+      - name: Restore conventional ccache without publication
+        if: matrix.provider == 'Ccache' && inputs.phase == 'warm'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ccache
+          key: llama-cpp-ccache-cpu-amd64-20261001-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: llama-cpp-ccache-cpu-amd64-20261001-
+          fail-on-cache-miss: true
+
+      - name: Inject conventional compiler-cache mount
+        if: matrix.provider == 'Ccache'
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+        with:
+          builder: ${{ steps.registry_builder.outputs.name }}
+          cache-map: '{"ccache": "/root/.ccache"}'
+          skip-extraction: ${{ inputs.phase == 'warm' }}
+
+      - name: Record build start
+        run: date +%s > "$RUNNER_TEMP/validation/build-start.txt"
+
+      - name: Build and push with registry cache
+        if: matrix.provider != 'BoringCache'
+        working-directory: operator
+        shell: bash
+        env:
+          BUILDER: ${{ steps.registry_builder.outputs.name }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          mapfile -t command < <(python3 -c 'import tomllib; p=tomllib.load(open(".boringcache.toml", "rb")); print("\n".join(p["adapters"]["docker"]["command"]))')
+          cache_args=()
+          if [ "$PHASE" != cold ]; then
+            cache_args+=(--cache-from "type=registry,ref=$CACHE_REF")
+          fi
+          if [ "$PHASE" != warm ]; then
+            cache_args+=(--cache-to "type=registry,ref=$CACHE_REF,mode=max,ignore-error=false")
+          fi
+          "${command[@]}" --builder "$BUILDER" "${cache_args[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/validation/build.log"
+
+      - name: Build and push with BoringCache compiler mount
+        if: matrix.provider == 'BoringCache' && inputs.phase != 'warm'
+        id: boringcache
+        uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+        with:
+          working-directory: operator
+          mode: docker
+          cli-version: ${{ inputs.cli_version }}
+          trust-policy: publish
+          diagnostics: summary
+          fail-on-cache-error: true
+
+      - name: Build and push with BoringCache restore
+        if: matrix.provider == 'BoringCache' && inputs.phase == 'warm'
+        id: boringcache_restore
+        uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+        with:
+          working-directory: operator
+          mode: docker
+          cli-version: ${{ inputs.cli_version }}
+          trust-policy: restore
+          diagnostics: summary
+          fail-on-cache-error: true
+          fail-on-cache-miss: true
+
+      - name: Record build duration
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/validation/build-start.txt" ]; then
+            started=$(cat "$RUNNER_TEMP/validation/build-start.txt")
+            printf 'build_and_push_seconds=%s\n' "$(($(date +%s) - started))" \
+              > "$RUNNER_TEMP/validation/timing.txt"
+          fi
+          df -h > "$RUNNER_TEMP/validation/disk-after.txt"
+
+      - name: Verify published CPU image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp image-metadata.json "$RUNNER_TEMP/validation/image-metadata.json"
+          digest=$(jq -er '."containerimage.digest"' image-metadata.json)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image="ghcr.io/boringcache/llama-cpp-validation@$digest"
+          docker pull "$image"
+          docker image inspect "$image" > "$RUNNER_TEMP/validation/image-inspect.json"
+          test "$(docker image inspect "$image" --format '{{.Architecture}}')" = amd64
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$APP_REVISION"
+          docker run --rm --entrypoint /app/llama-cli "$image" --version \
+            > "$RUNNER_TEMP/validation/cli-version.txt" 2>&1
+          docker run --rm --entrypoint /app/llama-server "$image" --version \
+            > "$RUNNER_TEMP/validation/server-version.txt" 2>&1
+          docker run --rm --entrypoint /bin/sh "$image" -c \
+            'cd /app && find . -maxdepth 1 -type f \( -name "llama*" -o -name "*.so*" \) -print0 | sort -z | xargs -0 sha256sum' \
+            > "$RUNNER_TEMP/validation/binaries.sha256"
+          test -s "$RUNNER_TEMP/validation/binaries.sha256"
+
+      - name: Retain validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.provider }}-${{ inputs.phase }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/validation
+            ${{ steps.boringcache.outputs.evidence-path }}
+            ${{ steps.boringcache_restore.outputs.evidence-path }}
+          retention-days: 30

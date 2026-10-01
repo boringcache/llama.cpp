@@ -1,0 +1,23 @@
+workspace = "boringcache/llama-cpp-validation"
+
+[adapters.docker]
+tag = "llama-cpp-full-cpu-amd64-20261001"
+no-git = true
+mount-cache = true
+metadata-hints = ["tool=oci", "workflow=prospect-validation", "case=llama-cpp-full-cpu"]
+command = [
+  "docker", "buildx", "build",
+  "--file", "../upstream/.devops/cpu.Dockerfile",
+  "--target", "full",
+  "--platform", "linux/amd64",
+  "--progress", "plain",
+  "--provenance", "false",
+  "--build-arg", "BUILD_DATE",
+  "--build-arg", "APP_VERSION",
+  "--build-arg", "APP_REVISION",
+  "--build-arg", "IMAGE_URL=https://github.com/ggml-org/llama.cpp",
+  "--build-arg", "IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp",
+  "--output", "type=image,name=ghcr.io/boringcache/llama-cpp-validation,push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true",
+  "--metadata-file", "../image-metadata.json",
+  "../upstream",
+]

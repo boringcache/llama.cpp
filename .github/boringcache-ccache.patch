@@ -1,0 +1,33 @@
+--- a/.devops/cpu.Dockerfile
++++ b/.devops/cpu.Dockerfile
+@@ -22,9 +22,10 @@
+ ARG TARGETARCH
+ 
+ RUN apt-get update && \
+-    apt-get install -y gcc-14 g++-14 build-essential git cmake libssl-dev
++    apt-get install -y gcc-14 g++-14 build-essential git cmake libssl-dev ccache
+ 
+ ENV CC=gcc-14 CXX=g++-14
++ENV CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=5G
+ 
+ WORKDIR /app
+ 
+@@ -32,13 +33,16 @@
+ 
+ COPY --from=web /app/tools/ui/dist tools/ui/dist
+ 
+-RUN if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ]; then \
++RUN --mount=type=cache,target=/root/.ccache \
++    ccache --zero-stats && \
++    if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ]; then \
+         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON; \
+     else \
+         echo "Unsupported architecture"; \
+         exit 1; \
+     fi && \
+-    cmake --build build -j $(nproc)
++    cmake --build build -j $(nproc) && \
++    ccache --show-stats
+ 
+ RUN mkdir -p /app/lib && \
+     find build -name "*.so*" -exec cp -P {} /app/lib \;
